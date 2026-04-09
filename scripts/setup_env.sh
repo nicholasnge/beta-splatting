@@ -11,6 +11,15 @@ echo "=== Setting up $ENV_NAME conda environment ==="
 echo "    Repo: $REPO_DIR"
 echo "    Note: nvcc must be in PATH (run 'nvcc --version' to verify)"
 
+# Prefer mamba (much lower RAM) over conda if available
+if command -v mamba &>/dev/null; then
+    CONDA_CMD="mamba"
+    echo "    Using: mamba"
+else
+    CONDA_CMD="conda"
+    echo "    Using: conda (mamba not found)"
+fi
+
 # Target A100 (sm_80). Set this so CUDA extensions compile correctly even
 # when no GPU is present on the login node — nvcc compiles for the specified
 # arch without needing a physical device.
@@ -18,7 +27,7 @@ export TORCH_CUDA_ARCH_LIST="8.0"
 export MAX_JOBS=8
 
 # Create env (conda-forge has Python 3.10 for linux-64)
-conda create -y -n "$ENV_NAME" python=3.10 -c conda-forge
+$CONDA_CMD create -y -n "$ENV_NAME" python=3.10 -c conda-forge
 
 # Install PyTorch cu124 (compatible with CUDA 12.x)
 conda run -n "$ENV_NAME" pip install torch torchvision torchaudio \
