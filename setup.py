@@ -45,7 +45,7 @@ class BuildSubmodule(Command):
     def run(self):
         submodule_path = os.path.join(os.path.dirname(__file__), "submodules")
         # Use pip to install the submodule; adjust the arguments as needed.
-        subprocess.check_call(["pip", "install", "."], cwd=submodule_path)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-build-isolation", "."], cwd=submodule_path)
 
 
 class CustomInstall(install):
