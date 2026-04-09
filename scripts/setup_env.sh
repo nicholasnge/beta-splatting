@@ -34,23 +34,18 @@ conda activate "$ENV_NAME"
 echo "    Python: $(which python)"
 
 # ── PyTorch cu124 ─────────────────────────────────────────────────────────────
-pip install torch torchvision torchaudio \
+# PYTHONNOUSERSITE=1 prevents pip from seeing ~/.local packages as "already
+# satisfied", ensuring all nvidia-* deps are installed in the conda env
+# (not left in ~/.local where their .so files won't be on LD_LIBRARY_PATH).
+PYTHONNOUSERSITE=1 pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu124
 
-# Force-install cusparseLt into the conda env — pip may skip it if it sees
-# a ~/.local version, but that .so won't be on LD_LIBRARY_PATH in the env.
-pip install nvidia-cusparselt-cu12 \
-    --index-url https://download.pytorch.org/whl/cu124 \
-    --force-reinstall --no-deps
-
 # ── Fix LD_LIBRARY_PATH for pip-wheel nvidia libs ─────────────────────────────
-# PyTorch pip wheels install .so files under site-packages/nvidia/*/lib/ which
-# is not on LD_LIBRARY_PATH by default, causing ImportError when torch is
-# imported in pip's build subprocesses (e.g. fused-ssim metadata step).
+# PyTorch pip wheels install .so files under site-packages/nvidia/*/lib/.
 SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
 NVIDIA_LIBS=$(find "$SITE_PKG/nvidia" -name "lib" -type d 2>/dev/null | tr '\n' ':')
 export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH:-}"
-echo "    LD_LIBRARY_PATH set for nvidia libs"
+echo "    LD_LIBRARY_PATH set: $NVIDIA_LIBS"
 
 # ── CUDA extensions (need torch visible — no build isolation) ─────────────────
 pip install --no-build-isolation \
