@@ -2,7 +2,7 @@
 #SBATCH --job-name=beta-splat
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100-40
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
@@ -49,10 +49,21 @@ conda activate beta_splatting
 
 mkdir -p "$OUT_ROOT" slurm_logs
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+# ── Validate scene structure ──────────────────────────────────────────────────
 SCENE_PATH="$DATA_ROOT/$SCENE"
 OUT_PATH="$OUT_ROOT/$SCENE"
 
+if [[ ! -d "$SCENE_PATH/sparse/0" ]]; then
+    echo "ERROR: Expected $SCENE_PATH/sparse/0/ — not found."
+    echo "       Contents of $SCENE_PATH: $(ls "$SCENE_PATH" 2>/dev/null)"
+    exit 1
+fi
+if [[ ! -f "$SCENE_PATH/sparse/0/cameras.bin" && ! -f "$SCENE_PATH/sparse/0/cameras.txt" ]]; then
+    echo "ERROR: No cameras.bin or cameras.txt in $SCENE_PATH/sparse/0/"
+    exit 1
+fi
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 echo "Scene:      $SCENE"
 echo "Data:       $SCENE_PATH"
 echo "Output:     $OUT_PATH"

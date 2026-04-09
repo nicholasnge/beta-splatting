@@ -2,7 +2,7 @@
 #SBATCH --job-name=beta-eval
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100-40
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:30:00
