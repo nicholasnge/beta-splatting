@@ -44,7 +44,8 @@ fi
 
 # ── Environment ───────────────────────────────────────────────────────────────
 REPO_DIR="$SLURM_SUBMIT_DIR"
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
+CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate beta_splatting
 
 mkdir -p "$OUT_ROOT" slurm_logs

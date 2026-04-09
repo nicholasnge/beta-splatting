@@ -1,51 +1,59 @@
 #!/bin/bash
 # One-time setup: creates the beta_splatting conda env on the cluster.
-# Run once from the login node: bash scripts/setup_env.sh
+# Best run as a SLURM job: sbatch scripts/setup_slurm.sh
 
 set -e
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# When called from setup_slurm.sh, SLURM_SUBMIT_DIR is more reliable
+if [[ -n "$SLURM_SUBMIT_DIR" ]]; then
+    REPO_DIR="$SLURM_SUBMIT_DIR"
+fi
+
 ENV_NAME="beta_splatting"
 
 echo "=== Setting up $ENV_NAME conda environment ==="
 echo "    Repo: $REPO_DIR"
-echo "    Note: nvcc must be in PATH (run 'nvcc --version' to verify)"
 
-# Prefer mamba (much lower RAM) over conda if available
-if command -v mamba &>/dev/null; then
-    CONDA_CMD="mamba"
-    echo "    Using: mamba"
-else
-    CONDA_CMD="conda"
-    echo "    Using: conda (mamba not found)"
-fi
-
-# Target A100 (sm_80). Set this so CUDA extensions compile correctly even
-# when no GPU is present on the login node — nvcc compiles for the specified
-# arch without needing a physical device.
+# A100 = sm_80. Explicit arch means nvcc compiles without querying a GPU.
 export TORCH_CUDA_ARCH_LIST="8.0"
 export MAX_JOBS=8
 
-# Create env (conda-forge has Python 3.10 for linux-64)
-$CONDA_CMD create -y -n "$ENV_NAME" python=3.10 -c conda-forge
+# ── Source conda ──────────────────────────────────────────────────────────────
+CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 
-# Install PyTorch cu124 (compatible with CUDA 12.x)
-conda run -n "$ENV_NAME" pip install torch torchvision torchaudio \
+# ── Create env ────────────────────────────────────────────────────────────────
+if conda env list | grep -q "^${ENV_NAME} "; then
+    echo "    Env '$ENV_NAME' already exists — skipping create"
+else
+    conda create -y -n "$ENV_NAME" python=3.10 -c conda-forge
+fi
+
+conda activate "$ENV_NAME"
+echo "    Python: $(which python)"
+
+# ── PyTorch cu124 ─────────────────────────────────────────────────────────────
+pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu124
 
-# Install CUDA extensions that need torch visible at build time (no isolation)
-TORCH_CUDA_ARCH_LIST="8.0" conda run -n "$ENV_NAME" \
-    pip install --no-build-isolation \
+# Force-install cusparseLt into the conda env — pip may skip it if it sees
+# a ~/.local version, but that .so won't be on LD_LIBRARY_PATH in the env.
+pip install nvidia-cusparselt-cu12 \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --force-reinstall --no-deps
+
+# ── CUDA extensions (need torch visible — no build isolation) ─────────────────
+pip install --no-build-isolation \
     "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157"
 
-conda run -n "$ENV_NAME" pip install --no-build-isolation \
+pip install --no-build-isolation \
     "plas @ git+https://github.com/fraunhoferhhi/PLAS.git"
 
-# Build custom gsplat submodule (CUDA extension — compiles without a GPU)
-TORCH_CUDA_ARCH_LIST="8.0" conda run -n "$ENV_NAME" \
-    pip install --no-build-isolation "$REPO_DIR/submodules"
+# ── Custom gsplat submodule ───────────────────────────────────────────────────
+pip install --no-build-isolation "$REPO_DIR/submodules"
 
-# Install main package (submodule already built above)
-conda run -n "$ENV_NAME" pip install --no-build-isolation "$REPO_DIR"
+# ── Main package ─────────────────────────────────────────────────────────────
+pip install --no-build-isolation "$REPO_DIR"
 
 echo "=== Done! Activate with: conda activate $ENV_NAME ==="
