@@ -43,6 +43,15 @@ pip install nvidia-cusparselt-cu12 \
     --index-url https://download.pytorch.org/whl/cu124 \
     --force-reinstall --no-deps
 
+# ── Fix LD_LIBRARY_PATH for pip-wheel nvidia libs ─────────────────────────────
+# PyTorch pip wheels install .so files under site-packages/nvidia/*/lib/ which
+# is not on LD_LIBRARY_PATH by default, causing ImportError when torch is
+# imported in pip's build subprocesses (e.g. fused-ssim metadata step).
+SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
+NVIDIA_LIBS=$(find "$SITE_PKG/nvidia" -name "lib" -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH:-}"
+echo "    LD_LIBRARY_PATH set for nvidia libs"
+
 # ── CUDA extensions (need torch visible — no build isolation) ─────────────────
 pip install --no-build-isolation \
     "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157"

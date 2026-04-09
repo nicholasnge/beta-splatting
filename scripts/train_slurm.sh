@@ -48,6 +48,10 @@ CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate beta_splatting
 
+SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
+NVIDIA_LIBS=$(find "$SITE_PKG/nvidia" -name "lib" -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH:-}"
+
 mkdir -p "$OUT_ROOT" slurm_logs
 
 # ── Validate scene structure ──────────────────────────────────────────────────
