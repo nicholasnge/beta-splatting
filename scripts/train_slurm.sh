@@ -21,7 +21,7 @@ set -e
 # ── Parse args ────────────────────────────────────────────────────────────────
 SCENE=""
 DATA_ROOT="$HOME/3DGSDATASETS"
-OUT_ROOT="$(dirname "$0")/../output"
+OUT_ROOT="$SLURM_SUBMIT_DIR/output"
 RESOLUTION=4
 CAP_MAX=300000
 EXTRA_ARGS=""
@@ -43,7 +43,7 @@ if [[ -z "$SCENE" ]]; then
 fi
 
 # ── Environment ───────────────────────────────────────────────────────────────
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$SLURM_SUBMIT_DIR"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate beta_splatting
 

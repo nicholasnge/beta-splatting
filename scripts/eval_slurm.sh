@@ -14,7 +14,7 @@ set -e
 
 SCENE=""
 DATA_ROOT="$HOME/3DGSDATASETS"
-OUT_ROOT="$(dirname "$0")/../output"
+OUT_ROOT="$SLURM_SUBMIT_DIR/output"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,7 +30,7 @@ if [[ -z "$SCENE" ]]; then
     exit 1
 fi
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$SLURM_SUBMIT_DIR"
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate beta_splatting
 

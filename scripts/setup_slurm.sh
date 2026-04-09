@@ -13,5 +13,7 @@
 #   sbatch scripts/setup_slurm.sh
 
 set -e
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# SLURM_SUBMIT_DIR = directory where sbatch was called (the repo root)
+REPO_DIR="$SLURM_SUBMIT_DIR"
+echo "Repo dir: $REPO_DIR"
 bash "$REPO_DIR/scripts/setup_env.sh"
