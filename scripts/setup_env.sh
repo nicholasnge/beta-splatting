@@ -17,12 +17,12 @@ echo "    Note: nvcc must be in PATH (run 'nvcc --version' to verify)"
 export TORCH_CUDA_ARCH_LIST="8.0"
 export MAX_JOBS=8
 
-# Create env
-conda create -y -n "$ENV_NAME" python=3.10
+# Create env (conda-forge has Python 3.10 for linux-64)
+conda create -y -n "$ENV_NAME" python=3.10 -c conda-forge
 
-# Install PyTorch — cu118 is forward-compatible with CUDA 12.0 toolkit
+# Install PyTorch cu124 (compatible with CUDA 12.x)
 conda run -n "$ENV_NAME" pip install torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu118
+    --index-url https://download.pytorch.org/whl/cu124
 
 # Install CUDA extensions that need torch visible at build time (no isolation)
 TORCH_CUDA_ARCH_LIST="8.0" conda run -n "$ENV_NAME" \
