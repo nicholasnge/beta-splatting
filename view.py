@@ -1,10 +1,24 @@
 import time
+import argparse
 import torch
 import viser
-from argparse import ArgumentParser
-from arguments import ModelParams, ViewerParams
-from scene import BetaModel
-from scene.beta_viewer import BetaViewer
+
+from model import BetaModel
+from renderer import view
+from viewer import BetaViewer
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Viewer script")
+    p.add_argument("--ply", type=str, default=None)
+    p.add_argument("--png", type=str, default=None)
+    p.add_argument("--sh_degree", type=int, default=0)
+    p.add_argument("--sb_number", type=int, default=2)
+    p.add_argument("--white_background", "-w", action="store_true")
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--share_url", action="store_true")
+    p.add_argument("--center", action="store_true")
+    return p.parse_args()
 
 
 @torch.no_grad()
@@ -19,11 +33,12 @@ def viewing(args):
 
     bg_color = [1, 1, 1] if args.white_background else [0, 0, 0]
     beta_model.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
     server = viser.ViserServer(port=args.port, verbose=False)
     viewer = BetaViewer(
         server=server,
-        render_fn=lambda camera_state, render_tab_state: beta_model.view(
-            camera_state, render_tab_state, args.center
+        render_fn=lambda camera_state, render_tab_state: view(
+            beta_model, camera_state, render_tab_state, args.center
         ),
         mode="rendering",
         share_url=args.share_url,
@@ -33,19 +48,5 @@ def viewing(args):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Viewing script parameters")
-    ModelParams(parser), ViewerParams(parser)
-    parser.add_argument("--ply", type=str, default=None, help="path to the .ply file")
-    parser.add_argument("--png", type=str, default=None, help="path to the png folder")
-    parser.add_argument(
-        "--share_url", action="store_true", help="Share URL for the viewer"
-    )
-    parser.add_argument(
-        "--center",
-        action="store_true",
-        help="Center the model in the viewer",
-    )
-
-    args = parser.parse_args()
-
+    args = parse_args()
     viewing(args)

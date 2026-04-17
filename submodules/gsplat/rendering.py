@@ -1,9 +1,7 @@
 import math
-from turtle import color
 from typing import Dict, Optional, Tuple
 
 import torch
-import torch.distributed
 import torch.nn.functional as F
 from torch import Tensor
 from typing_extensions import Literal
@@ -13,14 +11,7 @@ from .cuda._wrapper import (
     isect_offset_encode,
     isect_tiles,
     rasterize_to_pixels,
-    spherical_harmonics,
     spherical_beta,
-)
-from .distributed import (
-    all_gather_int32,
-    all_gather_tensor_list,
-    all_to_all_int32,
-    all_to_all_tensor_list,
 )
 from .utils import depth_to_normal, get_projection_matrix
 
@@ -31,7 +22,7 @@ def rasterization(
     scales: Tensor,  # [N, 3]
     opacities: Tensor,  # [N]
     betas: Tensor,  # [N]
-    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
+    colors: Tensor,  # [(C,) N, K, 3] — DC SH coefficients
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
     width: int,
@@ -42,7 +33,6 @@ def rasterization(
     eps2d: float = 0.3,
     sb_number: Optional[int] = None,
     sb_params: Optional[Tensor] = None,  # [N, sb_number, 6]
-    sh_degree: Optional[int] = None,
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
@@ -53,7 +43,6 @@ def rasterization(
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
-    distributed: bool = False,
     ortho: bool = False,
     covars: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
@@ -230,66 +219,16 @@ def rasterization(
         "RGB+ED",
     ], render_mode
 
-    def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
-        view_list = list(
-            map(
-                lambda x: x.split(int(x.shape[0] / C), dim=0),
-                world_view.split([C * N_i for N_i in N_world], dim=0),
-            )
-        )
-        return torch.stack([torch.cat(l, dim=0) for l in zip(*view_list)], dim=0)
-
+    # colors: [N, K, 3] or [C, N, K, 3] (DC SH coefficients, K >= 1)
+    assert (colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3) or (
+        colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+    ), colors.shape
     if sb_number:
         assert sb_params.shape == (C, N, sb_number, 6) or sb_params.shape == (
             N,
             sb_number,
             6,
         ), sb_params.shape
-    else:
-        if sh_degree is None:
-            # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
-            assert (colors.dim() == 2 and colors.shape[0] == N) or (
-                colors.dim() == 3 and colors.shape[:2] == (C, N)
-            ), colors.shape
-            if distributed:
-                assert (
-                    colors.dim() == 2
-                ), "Distributed mode only supports per-Gaussian colors."
-        else:
-            # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
-            # Allowing for activating partial SH bands
-            assert (
-                colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-            ) or (
-                colors.dim() == 4
-                and colors.shape[:2] == (C, N)
-                and colors.shape[3] == 3
-            ), colors.shape
-            assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
-            if distributed:
-                assert (
-                    colors.dim() == 3
-                ), "Distributed mode only supports per-Gaussian colors."
-
-    if absgrad:
-        assert not distributed, "AbsGrad is not supported in distributed mode."
-
-    # If in distributed mode, we distribute the projection computation over Gaussians
-    # and the rasterize computation over cameras. So first we gather the cameras
-    # from all ranks for projection.
-    if distributed:
-        world_rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-
-        # Gather the number of Gaussians in each rank.
-        N_world = all_gather_int32(world_size, N, device=device)
-
-        # Enforce that the number of cameras is the same across all ranks.
-        C_world = [C] * world_size
-        viewmats, Ks = all_gather_tensor_list(world_size, [viewmats, Ks])
-
-        # Silently change C from local #Cameras to global #Cameras.
-        C = len(viewmats)
 
     # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
     proj_results = fully_fused_projection(
@@ -349,172 +288,28 @@ def rasterization(
         }
     )
 
-    # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
-    if sh_degree is None:
-        # Colors are post-activation values, with shape [N, D] or [C, N, D]
-        if packed:
-            if colors.dim() == 2:
-                # Turn [N, D] into [nnz, D]
-                colors = colors[primitive_ids]
-            else:
-                # Turn [C, N, D] into [nnz, D]
-                colors = colors[camera_ids, primitive_ids]
-        else:
-            if colors.dim() == 2:
-                # Turn [N, D] into [C, N, D]
-                colors = colors.expand(C, -1, -1)
-            else:
-                # colors is already [C, N, D]
-                pass
+    # Evaluate degree-0 SH to get base RGB, then apply spherical beta.
+    # colors: [N, K, 3] or [C, N, K, 3] — only the DC term (index 0) is used.
+    SH_C0 = 0.28209479177387814
+    camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
+    if packed:
+        dirs = means[primitive_ids, :] - camtoworlds[camera_ids, :3, 3]  # [nnz, 3]
+        masks = radii > 0  # [nnz]
+        shs = colors[primitive_ids] if colors.dim() == 3 else colors[camera_ids, primitive_ids]  # [nnz, K, 3]
     else:
-        # Colors are SH coefficients, with shape [N, K, 3] or [C, N, K, 3]
-        colors = colors.clone()
-        if render_mode == "Specular":
-            colors[..., 0, :] = 0
-        elif render_mode == "Diffuse":
-            colors[..., 1:, :] = 0
-        camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
-        if packed:
-            dirs = means[primitive_ids, :] - camtoworlds[camera_ids, :3, 3]  # [nnz, 3]
-            masks = radii > 0  # [nnz]
-            if colors.dim() == 3:
-                # Turn [N, K, 3] into [nnz, 3]
-                shs = colors[primitive_ids, :, :]  # [nnz, K, 3]
-            else:
-                # Turn [C, N, K, 3] into [nnz, 3]
-                shs = colors[camera_ids, primitive_ids, :, :]  # [nnz, K, 3]
-            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
-        else:
-            dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
-            masks = radii > 0  # [C, N]
-            if colors.dim() == 3:
-                # Turn [N, K, 3] into [C, N, K, 3]
-                shs = colors.expand(C, -1, -1, -1)  # [C, N, K, 3]
-            else:
-                # colors is already [C, N, K, 3]
-                shs = colors
-            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [C, N, 3]
-        # make it apple-to-apple with Inria's CUDA Backend.
-        if render_mode != "Specular":
-            colors = torch.clamp_min(colors + 0.5, 0.0)
-        if sb_number:
-            if sb_params.dim() == 3:
-                sb_params = sb_params.expand(C, -1, -1, -1)
-            if render_mode == "Diffuse":
-                sb_params = torch.cat(
-                    [
-                        torch.zeros_like(sb_params[..., :3]),
-                        sb_params.clone()[..., 3:],
-                    ],
-                    -1,
-                )
-            colors = spherical_beta(
-                sb_number, dirs, colors, sb_params, masks=masks
-            )  # [C, N, 3]
-
-            colors = torch.clamp_min(colors, 0.0)
-
-    # If in distributed mode, we need to scatter the GSs to the destination ranks, based
-    # on which cameras they are visible to, which we already figured out in the projection
-    # stage.
-    if distributed:
-        if packed:
-            # count how many elements need to be sent to each rank
-            cnts = torch.bincount(camera_ids, minlength=C)  # all cameras
-            cnts = cnts.split(C_world, dim=0)
-            cnts = [cuts.sum() for cuts in cnts]
-
-            # all to all communication across all ranks. After this step, each rank
-            # would have all the necessary GSs to render its own images.
-            collected_splits = all_to_all_int32(world_size, cnts, device=device)
-            (radii,) = all_to_all_tensor_list(
-                world_size, [radii], cnts, output_splits=collected_splits
+        dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
+        masks = radii > 0  # [C, N]
+        shs = colors.expand(C, -1, -1, -1) if colors.dim() == 3 else colors  # [C, N, K, 3]
+    colors = torch.clamp_min(shs[..., 0, :] * SH_C0 + 0.5, 0.0)
+    if sb_number:
+        if sb_params.dim() == 3:
+            sb_params = sb_params.expand(C, -1, -1, -1)
+        if render_mode == "Diffuse":
+            sb_params = torch.cat(
+                [torch.zeros_like(sb_params[..., :3]), sb_params.clone()[..., 3:]], -1
             )
-            (
-                means2d,
-                depths,
-                conics,
-                opacities,
-                betas,
-                colors,
-            ) = all_to_all_tensor_list(
-                world_size,
-                [means2d, depths, conics, opacities, betas, colors],
-                cnts,
-                output_splits=collected_splits,
-            )
-
-            # before sending the data, we should turn the camera_ids from global to local.
-            # i.e. the camera_ids produced by the projection stage are over all cameras world-wide,
-            # so we need to turn them into camera_ids that are local to each rank.
-            offsets = torch.tensor(
-                [0] + C_world[:-1], device=camera_ids.device, dtype=camera_ids.dtype
-            )
-            offsets = torch.cumsum(offsets, dim=0)
-            offsets = offsets.repeat_interleave(torch.stack(cnts))
-            camera_ids = camera_ids - offsets
-
-            # and turn gaussian ids from local to global.
-            offsets = torch.tensor(
-                [0] + N_world[:-1],
-                device=primitive_ids.device,
-                dtype=primitive_ids.dtype,
-            )
-            offsets = torch.cumsum(offsets, dim=0)
-            offsets = offsets.repeat_interleave(torch.stack(cnts))
-            primitive_ids = primitive_ids + offsets
-
-            # all to all communication across all ranks.
-            (camera_ids, primitive_ids) = all_to_all_tensor_list(
-                world_size,
-                [camera_ids, primitive_ids],
-                cnts,
-                output_splits=collected_splits,
-            )
-
-            # Silently change C from global #Cameras to local #Cameras.
-            C = C_world[world_rank]
-
-        else:
-            # Silently change C from global #Cameras to local #Cameras.
-            C = C_world[world_rank]
-
-            # all to all communication across all ranks. After this step, each rank
-            # would have all the necessary GSs to render its own images.
-            (radii,) = all_to_all_tensor_list(
-                world_size,
-                [radii.flatten(0, 1)],
-                splits=[C_i * N for C_i in C_world],
-                output_splits=[C * N_i for N_i in N_world],
-            )
-            radii = reshape_view(C, radii, N_world)
-
-            (
-                means2d,
-                depths,
-                conics,
-                opacities,
-                betas,
-                colors,
-            ) = all_to_all_tensor_list(
-                world_size,
-                [
-                    means2d.flatten(0, 1),
-                    depths.flatten(0, 1),
-                    conics.flatten(0, 1),
-                    opacities.flatten(0, 1),
-                    betas.flatten(0, 1),
-                    colors.flatten(0, 1),
-                ],
-                splits=[C_i * N for C_i in C_world],
-                output_splits=[C * N_i for N_i in N_world],
-            )
-            means2d = reshape_view(C, means2d, N_world)
-            depths = reshape_view(C, depths, N_world)
-            conics = reshape_view(C, conics, N_world)
-            opacities = reshape_view(C, opacities, N_world)
-            betas = reshape_view(C, betas, N_world)
-            colors = reshape_view(C, colors, N_world)
+        colors = spherical_beta(sb_number, dirs, colors, sb_params, masks=masks)
+        colors = torch.clamp_min(colors, 0.0)
 
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
@@ -632,7 +427,7 @@ def _rasterization(
     scales: Tensor,  # [N, 3]
     opacities: Tensor,  # [N]
     betas: Tensor,  # [N]
-    colors: Tensor,  # [(C,) N, D] or [(C,) N, K, 3]
+    colors: Tensor,  # [(C,) N, K, 3] — DC SH coefficients
     viewmats: Tensor,  # [C, 4, 4]
     Ks: Tensor,  # [C, 3, 3]
     width: int,
@@ -642,7 +437,6 @@ def _rasterization(
     eps2d: float = 0.3,
     sb_number: Optional[int] = None,
     sb_params: Optional[Tensor] = None,  # [N, sb_number, 6]
-    sh_degree: Optional[int] = None,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
     render_mode: Literal[
@@ -693,29 +487,16 @@ def _rasterization(
         "RGB+ED",
     ], render_mode
 
+    # colors: [N, K, 3] or [C, N, K, 3] (DC SH coefficients, K >= 1)
+    assert (colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3) or (
+        colors.dim() == 4 and colors.shape[:2] == (C, N) and colors.shape[3] == 3
+    ), colors.shape
     if sb_number:
         assert sb_params.shape == (C, N, sb_number, 6) or sb_params.shape == (
             N,
             sb_number,
             6,
         ), sb_params.shape
-    else:
-        if sh_degree is None:
-            # treat colors as post-activation values, should be in shape [N, D] or [C, N, D]
-            assert (colors.dim() == 2 and colors.shape[0] == N) or (
-                colors.dim() == 3 and colors.shape[:2] == (C, N)
-            ), colors.shape
-        else:
-            # treat colors as SH coefficients, should be in shape [N, K, 3] or [C, N, K, 3]
-            # Allowing for activating partial SH bands
-            assert (
-                colors.dim() == 3 and colors.shape[0] == N and colors.shape[2] == 3
-            ) or (
-                colors.dim() == 4
-                and colors.shape[:2] == (C, N)
-                and colors.shape[3] == 3
-            ), colors.shape
-            assert (sh_degree + 1) ** 2 <= colors.shape[-2], colors.shape
 
     # Project Gaussians to 2D.
     # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
@@ -756,32 +537,18 @@ def _rasterization(
     )
     isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
-    # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
-    if sh_degree is None:
-        # Colors are post-activation values, with shape [N, D] or [C, N, D]
-        if colors.dim() == 2:
-            # Turn [N, D] into [C, N, D]
-            colors = colors.expand(C, -1, -1)
-        else:
-            # colors is already [C, N, D]
-            pass
-    else:
-        # Colors are SH coefficients, with shape [N, K, 3] or [C, N, K, 3]
-        camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
-        dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
-        masks = radii > 0  # [C, N]
-
-        shs = colors.expand(C, -1, -1, -1) if colors.dim() == 3 else colors
-        colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [C, N, 3]
-        colors = torch.clamp_min(colors + 0.5, 0.0)
-        if sb_number:
-            if sb_params.dim() == 3:
-                sb_params = sb_params.expand(C, -1, -1, -1)
-            colors = spherical_beta(
-                sb_number, dirs, colors, sb_params, masks=masks
-            )  # [C, N, 3]
-
-            colors = torch.clamp_min(colors, 0.0)
+    # Evaluate degree-0 SH to get base RGB, then apply spherical beta.
+    SH_C0 = 0.28209479177387814
+    camtoworlds = torch.inverse(viewmats)  # [C, 4, 4]
+    dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, N, 3]
+    masks = radii > 0  # [C, N]
+    shs = colors.expand(C, -1, -1, -1) if colors.dim() == 3 else colors  # [C, N, K, 3]
+    colors = torch.clamp_min(shs[..., 0, :] * SH_C0 + 0.5, 0.0)
+    if sb_number:
+        if sb_params.dim() == 3:
+            sb_params = sb_params.expand(C, -1, -1, -1)
+        colors = spherical_beta(sb_number, dirs, colors, sb_params, masks=masks)
+        colors = torch.clamp_min(colors, 0.0)
 
     # Rasterize to pixels
     if render_mode in ["RGB+D", "RGB+ED"]:
